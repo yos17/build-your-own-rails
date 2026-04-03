@@ -406,6 +406,256 @@ This is **one of the most common patterns in Rails**. It's how Concerns, Validat
 
 ---
 
+## Solutions
+
+### Exercise 1 — `order` on the Model
+
+```ruby
+# framework/lib/tracks/model.rb — add order class method
+
+module Tracks
+  class Model
+    # Post.order("created_at DESC")
+    # Post.order("title ASC")
+    def self.order(clause)
+      Query.new(self).order(clause)
+    end
+  end
+end
+
+# Usage:
+# File: app/controllers/posts_controller.rb
+class PostsController < Tracks::BaseController
+  def index
+    @posts = Post.order("created_at DESC")  # newest first
+    render :index
+  end
+end
+
+# Chaining also works (Query already returns self):
+# Post.where(user_id: 1).order("created_at DESC")
+# => SELECT * FROM posts WHERE user_id = 1 ORDER BY created_at DESC
+```
+
+### Exercise 2 — `limit` and chaining
+
+```ruby
+# framework/lib/tracks/model.rb — add limit class method
+
+module Tracks
+  class Model
+    # Post.limit(10)
+    def self.limit(n)
+      Query.new(self).limit(n)
+    end
+  end
+end
+
+# Usage:
+# File: app/controllers/posts_controller.rb
+class PostsController < Tracks::BaseController
+  def index
+    # Latest 5 active posts
+    @posts = Post.where(active: true).order("created_at DESC").limit(5)
+    render :index
+  end
+end
+
+# The Query class already supports chaining (each method returns self):
+# Post.where(user_id: 1).order("title ASC").limit(10)
+# => SELECT * FROM posts WHERE user_id = 1 ORDER BY title ASC LIMIT 10
+
+# Pagination helper using limit + offset (extend Query for this):
+# Post.limit(10).offset(20)   → page 3 with 10 per page
+module Tracks
+  class Query
+    def offset(n)
+      @offset = n
+      self
+    end
+
+    def to_sql
+      sql = "SELECT * FROM #{@model.table_name}"
+      sql += " WHERE #{@conditions.join(' AND ')}" unless @conditions.empty?
+      sql += " ORDER BY #{@order}" if @order
+      sql += " LIMIT #{@limit}"   if @limit
+      sql += " OFFSET #{@offset}" if defined?(@offset) && @offset
+      sql
+    end
+  end
+end
+```
+
+### Exercise 3 — `has_one`
+
+The framework already includes `has_one` in `associations.rb`. Here's how to use it:
+
+```ruby
+# framework/lib/tracks/associations.rb (already present — shown for reference)
+module Tracks
+  module Associations
+    module ClassMethods
+      # has_one :profile
+      # Generates: user.profile → Profile.find_by(user_id: user.id)
+      def has_one(name, class_name: nil, foreign_key: nil)
+        klass = class_name  || name.to_s.capitalize
+        fk    = foreign_key || "#{self.name.downcase}_id"
+
+        define_method(name) do
+          Object.const_get(klass).find_by(fk => @attributes["id"])
+        end
+      end
+    end
+  end
+end
+
+# Usage in app models:
+# File: app/models/user.rb
+class User < Tracks::Model
+  has_one :profile       # looks for Profile.find_by(user_id: user.id)
+  has_many :posts
+end
+
+# File: app/models/profile.rb
+class Profile < Tracks::Model
+  belongs_to :user
+end
+
+# In a controller:
+user    = User.find(1)
+profile = user.profile   # SELECT * FROM profiles WHERE user_id = 1 LIMIT 1
+puts profile.bio         # => "Ruby developer..."
+```
+
+### Exercise 4 — `before_save` callback
+
+```ruby
+# framework/lib/tracks/model.rb — add before_save callback support
+
+module Tracks
+  class Model
+    # --- Callbacks ---
+
+    def self.before_save(method_name)
+      @before_save_callbacks ||= []
+      @before_save_callbacks << method_name
+    end
+
+    def self.before_save_callbacks
+      @before_save_callbacks || []
+    end
+
+    # Override save to run callbacks
+    def save
+      return false unless valid?
+
+      # Run before_save callbacks
+      self.class.before_save_callbacks.each do |cb|
+        result = send(cb)
+        return false if result == false  # callback can halt by returning false
+      end
+
+      new_record? ? insert : update
+    end
+  end
+end
+
+# Usage in app models:
+# File: app/models/post.rb
+class Post < Tracks::Model
+  before_save :set_slug
+  before_save :normalize_title
+
+  validates :title, presence: true
+
+  private
+
+  def set_slug
+    # Auto-generate slug from title before saving
+    self.slug = title.to_s.downcase.strip.gsub(/\s+/, "-").gsub(/[^a-z0-9\-]/, "")
+  end
+
+  def normalize_title
+    # Capitalize first letter
+    self.title = title.to_s.strip.capitalize
+  end
+end
+
+# In use:
+post = Post.new(title: "  hello world!  ")
+post.save
+puts post.title   # => "Hello world!"
+puts post.slug    # => "hello-world"
+```
+
+### Exercise 5 — `after_create` callback
+
+```ruby
+# framework/lib/tracks/model.rb — add after_create callback support
+
+module Tracks
+  class Model
+    # --- Callbacks (extended) ---
+
+    def self.after_create(method_name)
+      @after_create_callbacks ||= []
+      @after_create_callbacks << method_name
+    end
+
+    def self.after_create_callbacks
+      @after_create_callbacks || []
+    end
+
+    private
+
+    def insert
+      cols  = @attributes.keys.reject { |k| k == "id" }
+      vals  = cols.map { |k| @attributes[k] }
+      ph    = cols.map { "?" }.join(", ")
+      self.class.db.execute(
+        "INSERT INTO #{self.class.table_name} (#{cols.join(', ')}) VALUES (#{ph})", vals
+      )
+      @attributes["id"] = self.class.db.last_insert_row_id
+      setup_accessors
+
+      # Fire after_create callbacks now that id is set
+      self.class.after_create_callbacks.each { |cb| send(cb) }
+
+      true
+    end
+  end
+end
+
+# Usage in app models:
+# File: app/models/user.rb
+class User < Tracks::Model
+  after_create :send_welcome_email
+  after_create :create_default_profile
+
+  validates :email, presence: true, uniqueness: true
+
+  private
+
+  def send_welcome_email
+    # In a real app: EmailJob.perform_later(id, :welcome)
+    puts "Welcome email queued for user ##{id} (#{email})"
+  end
+
+  def create_default_profile
+    Profile.create(user_id: id, bio: "New member")
+    puts "Default profile created for user ##{id}"
+  end
+end
+
+# After User.create(...), both callbacks fire automatically:
+user = User.new(name: "Yosia", email: "yosia@example.com")
+user.save
+# => "Welcome email queued for user #1 (yosia@example.com)"
+# => "Default profile created for user #1"
+```
+
+---
+
 ## What You Learned
 
 | Concept | Key point |

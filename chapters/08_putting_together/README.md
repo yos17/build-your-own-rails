@@ -365,6 +365,420 @@ Rails has had 20 years of edge cases handled. But the **architecture** is identi
 
 ---
 
+## Solutions
+
+### Exercise 1 — Add PostgreSQL support
+
+```ruby
+# framework/lib/tracks/adapters/postgresql.rb
+# Replace SQLite3 with the 'pg' gem for production-grade databases.
+
+require 'pg'
+
+module Tracks
+  module Adapters
+    class PostgreSQL
+      attr_reader :connection
+
+      def initialize(config = {})
+        @config = {
+          host:     ENV["DB_HOST"]     || "localhost",
+          port:     (ENV["DB_PORT"]    || 5432).to_i,
+          dbname:   ENV["DB_NAME"]     || "tracks_development",
+          user:     ENV["DB_USER"]     || "postgres",
+          password: ENV["DB_PASSWORD"] || ""
+        }.merge(config)
+
+        @connection = PG.connect(@config)
+      end
+
+      # Mimic SQLite3's execute interface so Model works unchanged
+      def execute(sql, params = [])
+        # PG uses $1, $2 placeholders; convert from ? style
+        pg_sql = convert_placeholders(sql)
+        result = @connection.exec_params(pg_sql, params)
+        result.to_a   # Array of hashes (column name => value)
+      end
+
+      def last_insert_row_id
+        @connection.exec("SELECT lastval()").first["lastval"].to_i
+      end
+
+      def results_as_hash=(val)
+        # PG always returns hashes — nothing to do
+      end
+
+      private
+
+      def convert_placeholders(sql)
+        i = 0
+        sql.gsub("?") { i += 1; "$#{i}" }
+      end
+    end
+  end
+end
+
+# framework/lib/tracks/model.rb — swap in the adapter via environment variable
+
+module Tracks
+  class Model
+    def self.db
+      @@db ||= begin
+        if ENV["DATABASE_ADAPTER"] == "postgresql"
+          Adapters::PostgreSQL.new
+        else
+          db = SQLite3::Database.new(ENV["DATABASE_PATH"] || "db/development.sqlite3")
+          db.results_as_hash = true
+          db
+        end
+      end
+    end
+  end
+end
+
+# To use PostgreSQL, set environment variables before starting the server:
+#   DATABASE_ADAPTER=postgresql
+#   DB_HOST=localhost
+#   DB_NAME=my_app_development
+#   DB_USER=postgres
+#   DB_PASSWORD=secret
+#
+# Then start normally:
+#   DATABASE_ADAPTER=postgresql rackup config.ru -p 3000
+```
+
+### Exercise 2 — Add authentication (BCrypt passwords)
+
+```ruby
+# Gemfile — add bcrypt gem
+# gem 'bcrypt'
+
+# app/models/user.rb — BCrypt password hashing
+require 'bcrypt'
+
+class User < Tracks::Model
+  validates :name,  presence: true
+  validates :email, presence: true, uniqueness: true
+
+  has_many :posts
+
+  # Store hashed password; never store plaintext
+  def password=(plaintext)
+    @attributes["password_digest"] = BCrypt::Password.create(plaintext)
+  end
+
+  def authenticate(plaintext)
+    digest = @attributes["password_digest"]
+    return false if digest.nil? || digest.empty?
+    BCrypt::Password.new(digest) == plaintext
+  end
+end
+
+# app/controllers/sessions_controller.rb — login / logout
+class SessionsController < Tracks::BaseController
+  def new
+    render :new
+  end
+
+  def create
+    user = User.find_by(email: params["email"])
+
+    if user&.authenticate(params["password"])
+      session[:user_id] = user.id
+      flash[:notice] = "Welcome back, #{user.name}!"
+      redirect_to "/posts"
+    else
+      @error = "Invalid email or password."
+      render :new
+    end
+  end
+
+  def destroy
+    session.delete(:user_id)
+    flash[:notice] = "Logged out."
+    redirect_to "/login"
+  end
+end
+
+# app/controllers/application_controller.rb — shared auth helpers
+class ApplicationController < Tracks::BaseController
+  def current_user
+    return nil unless session[:user_id]
+    @current_user ||= User.find(session[:user_id])
+  rescue
+    nil
+  end
+
+  def logged_in?
+    !!current_user
+  end
+
+  def require_login
+    unless logged_in?
+      flash[:error] = "You must be logged in."
+      redirect_to "/login"
+    end
+  end
+end
+
+# All other controllers inherit from ApplicationController:
+class PostsController < ApplicationController
+  before_action :require_login, only: [:new, :create, :edit, :update, :destroy]
+  # ...
+end
+```
+
+### Exercise 3 — JSON API support
+
+```ruby
+# framework/lib/tracks/base_controller.rb — add format detection
+
+module Tracks
+  class BaseController
+    def request_format
+      content_type = @request.env["CONTENT_TYPE"] || ""
+      accept       = @request.env["HTTP_ACCEPT"]  || ""
+      path         = @request.path
+
+      if path.end_with?(".json") || accept.include?("application/json") ||
+         content_type.include?("application/json")
+        :json
+      else
+        :html
+      end
+    end
+
+    def json_request?
+      request_format == :json
+    end
+
+    # Respond to different formats in one action:
+    def respond_to
+      yield FormatResponder.new(self)
+    end
+
+    class FormatResponder
+      def initialize(controller)
+        @controller = controller
+        @format     = controller.request_format
+      end
+
+      def html(&block)
+        block.call if @format == :html
+      end
+
+      def json(&block)
+        block.call if @format == :json
+      end
+    end
+  end
+end
+
+# Usage in a controller action:
+# File: app/controllers/posts_controller.rb
+class PostsController < ApplicationController
+  def index
+    @posts = Post.all
+
+    respond_to do |format|
+      format.html { render :index }
+      format.json { render_json(@posts.map(&:to_h)) }
+    end
+  end
+
+  def show
+    @post = Post.find(params["id"])
+
+    respond_to do |format|
+      format.html { render :show }
+      format.json { render_json(@post.to_h) }
+    end
+  end
+
+  def create
+    @post = Post.new(
+      title:   params["title"] || params.dig("post", "title"),
+      body:    params["body"]  || params.dig("post", "body"),
+      user_id: session[:user_id]
+    )
+
+    if @post.save
+      respond_to do |format|
+        format.html { redirect_to "/posts/#{@post.id}" }
+        format.json { render_json(@post.to_h, status: 201) }
+      end
+    else
+      respond_to do |format|
+        format.html { render :new }
+        format.json { render_json({ errors: @post.errors }, status: 422) }
+      end
+    end
+  end
+end
+
+# Example JSON API calls:
+#   curl http://localhost:3000/posts.json
+#   curl http://localhost:3000/posts -H "Accept: application/json"
+#   curl -X POST http://localhost:3000/posts \
+#        -H "Content-Type: application/json" \
+#        -d '{"title":"Hello","body":"World"}'
+```
+
+### Exercise 4 — Background jobs
+
+```ruby
+# framework/lib/tracks/job.rb — simple background job system
+
+require 'json'
+
+module Tracks
+  class Job
+    @@queue = []
+    @@mutex = Mutex.new
+
+    # DSL: class method to enqueue
+    def self.perform_later(*args)
+      @@mutex.synchronize do
+        @@queue << { job: name, args: args, enqueued_at: Time.now.to_f }
+      end
+      puts "[Job] Enqueued #{name} with args: #{args.inspect}"
+    end
+
+    # Process all pending jobs (call from a background thread or worker process)
+    def self.drain_queue!
+      @@mutex.synchronize do
+        jobs = @@queue.dup
+        @@queue.clear
+        jobs
+      end.each do |job_data|
+        klass = Object.const_get(job_data[:job])
+        klass.new.perform(*job_data[:args])
+      end
+    end
+
+    # Subclasses implement perform:
+    def perform(*args)
+      raise NotImplementedError, "#{self.class}#perform must be implemented"
+    end
+  end
+end
+
+# Start a worker thread in config.ru:
+#   Thread.new do
+#     loop do
+#       Tracks::Job.drain_queue!
+#       sleep 1
+#     end
+#   end
+
+# Usage — define specific jobs:
+# File: app/jobs/welcome_email_job.rb
+class WelcomeEmailJob < Tracks::Job
+  def perform(user_id)
+    user = User.find(user_id)
+    # In a real app, send email via SMTP / SendGrid / etc.
+    puts "[WelcomeEmailJob] Sending welcome email to #{user.email}"
+    # Mail.deliver(to: user.email, subject: "Welcome!", body: "...")
+  end
+end
+
+# File: app/jobs/post_notification_job.rb
+class PostNotificationJob < Tracks::Job
+  def perform(post_id)
+    post = Post.find(post_id)
+    puts "[PostNotificationJob] Notifying followers about post ##{post_id}: #{post.title}"
+  end
+end
+
+# In a controller — enqueue without blocking the HTTP response:
+# File: app/controllers/users_controller.rb
+class UsersController < ApplicationController
+  def create
+    @user = User.new(name: params["name"], email: params["email"])
+    @user.password = params["password"]
+
+    if @user.save
+      WelcomeEmailJob.perform_later(@user.id)   # runs in background
+      redirect_to "/posts"
+    else
+      render :new
+    end
+  end
+end
+
+class PostsController < ApplicationController
+  def create
+    @post = Post.new(title: params["post[title]"], body: params["post[body]"], user_id: session[:user_id])
+    if @post.save
+      PostNotificationJob.perform_later(@post.id)  # async
+      redirect_to "/posts/#{@post.id}"
+    else
+      render :new
+    end
+  end
+end
+```
+
+### Exercise 5 — Read Rails source (guided tour)
+
+```ruby
+# This exercise is exploratory. Here are the key Rails files that mirror
+# what we built, and what to look for in each one.
+
+# 1. ROUTING — actionpack/lib/action_dispatch/routing/
+#
+#    mapper.rb          — defines get/post/resources/scope etc (like our Router#draw)
+#    route_set.rb       — the RouteSet class, stores all routes (like our @routes array)
+#    pattern.rb         — converts "/posts/:id" to a regex (like our Router#match)
+#
+#    Key similarity: Rails' get/post/resources are methods on a Mapper object,
+#    and routes.draw runs the block with instance_eval — exactly like us.
+
+# 2. CONTROLLERS — actionpack/lib/action_controller/
+#
+#    base.rb            — ActionController::Base (like our BaseController)
+#    metal.rb           — the Rack interface layer
+#    rendering.rb       — render method (like our BaseController#render)
+#    redirecting.rb     — redirect_to (like our #redirect_to)
+#    before_action.rb   — callbacks (like our before_action)
+#    params_wrapper.rb  — nested params parsing (like our Exercise 4 in Ch 3)
+#
+#    Key similarity: Rails controllers use the same `send(action)` dispatch
+#    and binding tricks for views.
+
+# 3. MODELS — activerecord/lib/active_record/
+#
+#    base.rb            — ActiveRecord::Base (like our Model)
+#    relation.rb        — the Query object (like our Query class)
+#    associations/      — belongs_to, has_many (like our Associations module)
+#    validations/       — validates :field, rules (like our Validations module)
+#    callbacks.rb       — before_save, after_create (like our Ch 5 exercises)
+#    connection_adapters/— PostgreSQL/SQLite adapters (like our Ch 8 Exercise 1)
+#
+#    Key similarity: ActiveRecord::Relation (the query object) returns `self`
+#    for chaining, executes SQL lazily — exactly like our Query class.
+
+# 4. MIDDLEWARE — railties/lib/rails/application/
+#
+#    default_middleware_stack.rb — lists ~20 default middleware
+#
+#    actionpack/lib/action_dispatch/middleware/
+#      flash.rb         — flash messages (like our Ch 7 Exercise 4)
+#      session/         — cookie and database session stores
+#      request_id.rb    — X-Request-ID (like our Ch 7 Exercise 3)
+#      logger.rb        — request logging (like our Logger middleware)
+
+# Quick way to see Rails' middleware stack for a real app:
+#   cd my_rails_app
+#   rails middleware
+#
+# You'll recognize: Rack::Sendfile, ActionDispatch::Static, Rack::MethodOverride,
+# ActionDispatch::RequestId, ActionDispatch::RemoteIp, ActionDispatch::Session::CookieStore,
+# ActionDispatch::Flash... all the same concepts we built.
+```
+
+---
+
 ## The Final Lesson
 
 Rails is not magic. It's Ruby.

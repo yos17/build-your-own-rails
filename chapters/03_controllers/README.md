@@ -364,6 +364,323 @@ Notice `@before_actions ||= []` — the `||=` means "set to empty array if it's 
 
 ---
 
+## Solutions
+
+### Exercise 1 — `after_action`
+
+```ruby
+# framework/lib/tracks/base_controller.rb — add after_action support
+
+module Tracks
+  class BaseController
+    # --- After actions ---
+
+    def self.after_action(method_name, only: nil, except: nil)
+      @after_actions ||= []
+      @after_actions << {
+        method: method_name,
+        only:   Array(only).map(&:to_sym),
+        except: Array(except).map(&:to_sym)
+      }
+    end
+
+    def self.after_actions
+      @after_actions || []
+    end
+
+    def run_after_actions(action_name)
+      self.class.after_actions.each do |aa|
+        next if aa[:only].any?   && !aa[:only].include?(action_name.to_sym)
+        next if aa[:except].any? &&  aa[:except].include?(action_name.to_sym)
+        send(aa[:method])
+      end
+    end
+  end
+end
+
+# In framework/lib/tracks/dispatcher.rb, update the dispatch to call after_actions:
+#
+#   controller.run_before_actions(route.action)
+#   controller.send(route.action)
+#   controller.run_after_actions(route.action)   # <-- add this line
+#   response.to_rack
+
+# Usage in an app controller:
+# File: app/controllers/posts_controller.rb
+class PostsController < Tracks::BaseController
+  after_action :log_action
+  after_action :track_analytics, only: [:show, :index]
+
+  def index
+    @posts = Post.all
+    render :index
+  end
+
+  private
+
+  def log_action
+    puts "[PostsController] Action completed at #{Time.now}"
+  end
+
+  def track_analytics
+    # Could write to an analytics table, etc.
+    puts "[Analytics] Page viewed: #{request.path}"
+  end
+end
+```
+
+### Exercise 2 — `render_nothing(status: 204)`
+
+```ruby
+# framework/lib/tracks/base_controller.rb — add render_nothing
+
+module Tracks
+  class BaseController
+    def render_nothing(status: 204)
+      response.status = status
+      response.headers["Content-Length"] = "0"
+      # body stays empty — no response.write call
+    end
+  end
+end
+
+# Usage:
+# File: app/controllers/likes_controller.rb
+class LikesController < Tracks::BaseController
+  def create
+    post = Post.find(params["post_id"])
+    Like.create(post_id: post.id, user_id: session[:user_id])
+    render_nothing(status: 204)   # 204 No Content — AJAX-friendly
+  end
+
+  def destroy
+    Like.find(params["id"]).destroy
+    render_nothing   # defaults to 204
+  end
+end
+```
+
+### Exercise 3 — `head :ok`
+
+```ruby
+# framework/lib/tracks/base_controller.rb — add head helper
+
+module Tracks
+  class BaseController
+    STATUS_CODES = {
+      ok:                  200,
+      created:             201,
+      accepted:            202,
+      no_content:          204,
+      moved_permanently:   301,
+      found:               302,
+      not_modified:        304,
+      bad_request:         400,
+      unauthorized:        401,
+      forbidden:           403,
+      not_found:           404,
+      unprocessable_entity: 422,
+      internal_server_error: 500
+    }.freeze
+
+    def head(status_symbol, headers: {})
+      code = STATUS_CODES.fetch(status_symbol, status_symbol)
+      response.status = code
+      headers.each { |k, v| response.headers[k.to_s] = v }
+      # no body written
+    end
+  end
+end
+
+# Usage:
+# File: app/controllers/api/posts_controller.rb
+class Api::PostsController < Tracks::BaseController
+  def create
+    post = Post.new(title: params["title"], body: params["body"])
+    if post.save
+      head :created, headers: { "Location" => "/api/posts/#{post.id}" }
+    else
+      render_json({ errors: post.errors }, status: 422)
+    end
+  end
+
+  def update
+    post = Post.find(params["id"])
+    post.title = params["title"]
+    post.save
+    head :ok
+  end
+end
+```
+
+### Exercise 4 — Nested params (`params[:post][:title]`)
+
+```ruby
+# framework/lib/tracks/request.rb — update parse_params to build nested hashes
+
+module Tracks
+  class Request
+    private
+
+    def parse_params
+      params = {}
+
+      query = @env["QUERY_STRING"] || ""
+      parse_encoded_string(query, params)
+
+      if ["POST", "PATCH", "PUT"].include?(@method)
+        parse_encoded_string(body.to_s, params)
+      end
+
+      params
+    end
+
+    # Parse "post[title]=Hello&post[body]=World" into
+    # { "post" => { "title" => "Hello", "body" => "World" } }
+    def parse_encoded_string(str, params)
+      str.split("&").each do |pair|
+        raw_key, raw_value = pair.split("=", 2)
+        next unless raw_key
+
+        key   = URI.decode_www_form_component(raw_key)
+        value = URI.decode_www_form_component(raw_value.to_s)
+
+        assign_nested_param(params, key, value)
+      end
+      params
+    end
+
+    # "post[title]" → params["post"]["title"] = value
+    # "tags[]"      → params["tags"] = [..., value]
+    # "name"        → params["name"] = value
+    def assign_nested_param(hash, key, value)
+      if key.include?("[")
+        root, rest = key.split("[", 2)
+        rest = rest.chomp("]")
+
+        if rest.empty?
+          # Array param: tags[]
+          hash[root] ||= []
+          hash[root] << value
+        else
+          # Nested hash: post[title]
+          hash[root] ||= {}
+          # Recurse for deeper nesting: post[meta][keywords]
+          if rest.include?("[")
+            inner_key = rest
+            assign_nested_param(hash[root], inner_key, value)
+          else
+            hash[root][rest] = value
+          end
+        end
+      else
+        hash[key] = value
+      end
+    end
+  end
+end
+
+# Usage in a controller — params now supports nested access:
+# File: app/controllers/posts_controller.rb
+class PostsController < Tracks::BaseController
+  def create
+    # Form sends: post[title]=Hello&post[body]=World
+    post_params = params["post"]   # => { "title" => "Hello", "body" => "World" }
+
+    @post = Post.new(
+      title: post_params["title"],
+      body:  post_params["body"],
+      user_id: session[:user_id]
+    )
+
+    if @post.save
+      redirect_to "/posts/#{@post.id}"
+    else
+      render :new
+    end
+  end
+end
+```
+
+### Exercise 5 — Flash messages
+
+```ruby
+# framework/lib/tracks/base_controller.rb — add flash support
+
+module Tracks
+  class BaseController
+    # Flash: survives exactly one redirect, then is cleared
+    def flash
+      @flash ||= Flash.new(session)
+    end
+
+    class Flash
+      def initialize(session)
+        @session = session
+        @session[:flash] ||= {}
+        @session[:flash_used] ||= []
+      end
+
+      def []=(key, value)
+        @session[:flash][key.to_s] = value
+      end
+
+      def [](key)
+        @session[:flash][key.to_s]
+      end
+
+      def any?
+        !@session[:flash].empty?
+      end
+
+      # Call this at the start of each request to sweep used flash entries
+      def sweep!
+        @session[:flash_used].each { |k| @session[:flash].delete(k) }
+        @session[:flash_used] = @session[:flash].keys
+      end
+    end
+  end
+end
+
+# In framework/lib/tracks/dispatcher.rb, sweep flash before each action:
+#
+#   controller = controller_class.new(request, response)
+#   controller.flash.sweep!   # <-- add this line
+#   controller.run_before_actions(route.action)
+#   controller.send(route.action)
+
+# Usage in app controllers:
+# File: app/controllers/posts_controller.rb
+class PostsController < Tracks::BaseController
+  def create
+    @post = Post.new(title: params["post[title]"], body: params["post[body]"])
+    if @post.save
+      flash[:notice] = "Post created successfully!"
+      redirect_to "/posts/#{@post.id}"
+    else
+      flash[:error] = "Could not create post."
+      render :new
+    end
+  end
+
+  def destroy
+    Post.find(params["id"]).destroy
+    flash[:notice] = "Post deleted."
+    redirect_to "/posts"
+  end
+end
+
+# In your layout (app/views/layouts/application.html.erb):
+# <% if flash[:notice] %>
+#   <div class="flash notice"><%= flash[:notice] %></div>
+# <% end %>
+# <% if flash[:error] %>
+#   <div class="flash error"><%= flash[:error] %></div>
+# <% end %>
+```
+
+---
+
 ## What You Learned
 
 | Concept | Key point |

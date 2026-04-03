@@ -329,6 +329,306 @@ end
 
 ---
 
+## Solutions
+
+### Exercise 1 — `number_to_currency` helper
+
+```ruby
+# framework/lib/tracks.rb (or framework/lib/tracks/helpers.rb) — add to Helpers module
+
+module Tracks
+  module Helpers
+    # number_to_currency(19.99)      => "$19.99"
+    # number_to_currency(1234.5)     => "$1,234.50"
+    # number_to_currency(0)          => "$0.00"
+    # number_to_currency(9.9, unit: "€", separator: ",", delimiter: ".") => "€9,90"
+    def number_to_currency(amount, unit: "$", separator: ".", delimiter: ",", precision: 2)
+      rounded = amount.round(precision)
+      integer_part, decimal_part = ("%.#{precision}f" % rounded).split(".")
+
+      # Insert thousands delimiter
+      integer_with_delimiters = integer_part
+        .chars
+        .reverse
+        .each_slice(3)
+        .map(&:join)
+        .join(delimiter)
+        .reverse
+
+      "#{unit}#{integer_with_delimiters}#{separator}#{decimal_part}"
+    end
+  end
+end
+
+# Usage in any ERB template (helpers are included in BaseController):
+# <%= number_to_currency(19.99) %>         → $19.99
+# <%= number_to_currency(1234.567) %>      → $1,234.57
+# <%= number_to_currency(price) %>
+```
+
+### Exercise 2 — `content_for` and `yield :section`
+
+```ruby
+# framework/lib/tracks/base_controller.rb — add content_for support
+
+module Tracks
+  class BaseController
+    # Store named content blocks
+    def content_for(section, &block)
+      @_content_sections ||= {}
+      @_content_sections[section.to_sym] = block ? yield : ""
+    end
+
+    # Called in layouts: yield :head, yield :scripts, etc.
+    # Overrides Ruby's built-in yield when called with an argument.
+    def yield_section(section)
+      @_content_sections ||= {}
+      @_content_sections[section.to_sym] || ""
+    end
+  end
+end
+
+# framework/lib/tracks/base_controller.rb — update render to expose yield_section
+#
+# In the layout template, use yield_section(:name) instead of plain yield.
+# The @_content variable already holds the main page body.
+
+# Usage in a page template (app/views/posts/show.html.erb):
+#
+#   <% content_for :title do %>Posts — <%= h(@post.title) %><% end %>
+#   <% content_for :scripts do %>
+#     <script src="/js/highlight.js"></script>
+#   <% end %>
+#
+#   <article>
+#     <h1><%= h(@post.title) %></h1>
+#     <p><%= @post.body %></p>
+#   </article>
+
+# In the layout (app/views/layouts/application.html.erb):
+#
+#   <head>
+#     <title><%= yield_section(:title) || "My App" %></title>
+#     <%= yield_section(:head) %>
+#   </head>
+#   <body>
+#     <%= @_content %>
+#     <%= yield_section(:scripts) %>
+#   </body>
+
+# The render method in base_controller already evaluates in the controller's
+# binding, so content_for and yield_section are naturally available in templates.
+```
+
+### Exercise 3 — `cycle` helper
+
+```ruby
+# Add to Tracks::Helpers module
+
+module Tracks
+  module Helpers
+    # cycle("odd", "even") returns values in rotation on successive calls
+    # Useful for alternating CSS classes in loops.
+    #
+    # <% @posts.each do |post| %>
+    #   <div class="post <%= cycle('odd', 'even') %>">...</div>
+    # <% end %>
+
+    def cycle(*values, name: :default)
+      @_cycles ||= {}
+      @_cycles[name] ||= 0
+      value = values[@_cycles[name] % values.size]
+      @_cycles[name] += 1
+      value
+    end
+
+    def reset_cycle(name = :default)
+      @_cycles ||= {}
+      @_cycles[name] = 0
+    end
+  end
+end
+
+# Usage in a template:
+#
+# <ul>
+# <% @posts.each do |post| %>
+#   <li class="<%= cycle('odd', 'even') %>">
+#     <%= h(post.title) %>
+#   </li>
+# <% end %>
+# </ul>
+#
+# Multiple independent cycles in the same template:
+# <% @posts.each do |post| %>
+#   <tr class="<%= cycle('odd', 'even', name: :rows) %>">
+#     <td style="color: <%= cycle('red', 'green', 'blue', name: :colors) %>">
+#       <%= h(post.title) %>
+#     </td>
+#   </tr>
+# <% end %>
+```
+
+### Exercise 4 — `form_for(@post)` with pre-filled values
+
+```ruby
+# Add to Tracks::Helpers module
+
+module Tracks
+  module Helpers
+    # form_for(@post) generates a form pointed at the right URL
+    # with existing values pre-filled.
+    #
+    # New record  → POST /posts
+    # Persisted   → PATCH /posts/5  (via _method hidden field)
+    #
+    # Usage in a template:
+    #   <%= form_for(@post) do |f| %>
+    #     <%= f.text_field :title %>
+    #     <%= f.textarea :body %>
+    #     <%= f.submit %>
+    #   <% end %>
+
+    def form_for(object, url: nil, &block)
+      model_name = object.class.name.downcase          # "post"
+      url      ||= object.persisted? ? "/#{model_name}s/#{object.id}" : "/#{model_name}s"
+      method     = object.persisted? ? "PATCH" : "POST"
+      form_method = "POST"
+      method_field = method != "POST" ?
+        "<input type='hidden' name='_method' value='#{method}'>" : ""
+
+      # Form builder object that scopes field names to the model
+      builder = FormBuilder.new(model_name, object)
+      inner = block.call(builder)
+
+      "<form action=\"#{url}\" method=\"#{form_method}\">#{method_field}#{inner}</form>"
+    end
+
+    class FormBuilder
+      def initialize(model_name, object)
+        @model_name = model_name
+        @object     = object
+      end
+
+      def text_field(attr, placeholder: nil)
+        value = @object.respond_to?(attr) ? @object.send(attr).to_s : ""
+        ph = placeholder ? " placeholder=\"#{placeholder}\"" : ""
+        "<input type=\"text\" name=\"#{@model_name}[#{attr}]\" value=\"#{h(value)}\"#{ph}>"
+      end
+
+      def textarea(attr, rows: 8)
+        value = @object.respond_to?(attr) ? @object.send(attr).to_s : ""
+        "<textarea name=\"#{@model_name}[#{attr}]\" rows=\"#{rows}\">#{h(value)}</textarea>"
+      end
+
+      def hidden_field(attr, value: nil)
+        val = value || (@object.respond_to?(attr) ? @object.send(attr).to_s : "")
+        "<input type=\"hidden\" name=\"#{@model_name}[#{attr}]\" value=\"#{h(val)}\">"
+      end
+
+      def submit(label = nil)
+        label ||= @object.persisted? ? "Update" : "Create"
+        "<input type=\"submit\" value=\"#{label}\">"
+      end
+
+      private
+
+      def h(text)
+        text.to_s
+          .gsub("&", "&amp;").gsub("<", "&lt;")
+          .gsub(">", "&gt;").gsub('"', "&quot;")
+      end
+    end
+  end
+end
+
+# Usage in app/views/posts/new.html.erb:
+#
+#   <h1>New Post</h1>
+#   <%= form_for(@post) do |f| %>
+#     <p><label>Title<br><%= f.text_field :title, placeholder: "Enter title..." %></label></p>
+#     <p><label>Body<br><%= f.textarea :body, rows: 10 %></label></p>
+#     <%= f.submit %>
+#   <% end %>
+#
+# Usage in app/views/posts/edit.html.erb:
+#
+#   <h1>Edit Post</h1>
+#   <%= form_for(@post) do |f| %>
+#     <p><label>Title<br><%= f.text_field :title %></label></p>
+#     <p><label>Body<br><%= f.textarea :body %></label></p>
+#     <%= f.submit "Save Changes" %>
+#   <% end %>
+#   <%# Generates: <form action="/posts/5" method="POST">
+#                    <input type="hidden" name="_method" value="PATCH"> ... %>
+```
+
+### Exercise 5 — Template caching
+
+```ruby
+# framework/lib/tracks/erb_template.rb — add a class-level cache
+
+module Tracks
+  module Views
+    class ERBTemplate
+      # Cache compiled ERB objects, keyed by file path + mtime
+      @cache = {}
+      @cache_enabled = (ENV["RACK_ENV"] == "production")
+
+      class << self
+        attr_accessor :cache_enabled
+
+        def render(template_path, context_binding, layout: true)
+          raise "Template not found: #{template_path}" unless File.exist?(template_path)
+
+          page_content = compiled(template_path).result(context_binding)
+
+          if layout && File.exist?("app/views/layouts/application.html.erb")
+            # The layout references @_content, which must be set in context_binding
+            # (BaseController#render already sets @_content = page_content)
+            compiled("app/views/layouts/application.html.erb").result(context_binding)
+          else
+            page_content
+          end
+        end
+
+        def invalidate_cache!
+          @cache.clear
+        end
+
+        private
+
+        def compiled(path)
+          if @cache_enabled
+            mtime = File.mtime(path).to_i
+            key   = "#{path}:#{mtime}"
+
+            unless @cache[key]
+              # Remove old version of this path if present
+              @cache.delete_if { |k, _| k.start_with?("#{path}:") }
+              @cache[key] = ERB.new(File.read(path))
+            end
+
+            @cache[key]
+          else
+            # Development: always re-read from disk for live reloading
+            ERB.new(File.read(path))
+          end
+        end
+      end
+    end
+  end
+end
+
+# To enable caching in production (config.ru or environment config):
+# Tracks::Views::ERBTemplate.cache_enabled = true
+#
+# In development it's off by default, so templates reload on every request.
+# In production, templates are compiled once and reused.
+```
+
+---
+
 ## What You Learned
 
 | Concept | Key point |

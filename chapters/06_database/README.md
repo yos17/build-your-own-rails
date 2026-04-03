@@ -386,6 +386,331 @@ end
 
 ---
 
+## Solutions
+
+### Exercise 1 — `add_column` migration helper
+
+```ruby
+# db/migrations/003_add_published_to_posts.rb
+class AddPublishedToPosts
+  def initialize(db)
+    @db = db
+  end
+
+  def up
+    # SQLite supports a limited ALTER TABLE — only ADD COLUMN
+    @db.execute("ALTER TABLE posts ADD COLUMN published INTEGER DEFAULT 0")
+    @db.execute("ALTER TABLE posts ADD COLUMN published_at DATETIME")
+    puts "Added 'published' and 'published_at' columns to posts"
+  end
+
+  def down
+    # SQLite doesn't support DROP COLUMN directly.
+    # Workaround: recreate the table without the column.
+    @db.execute(<<-SQL)
+      CREATE TABLE posts_backup AS
+        SELECT id, title, body, user_id, created_at FROM posts
+    SQL
+    @db.execute("DROP TABLE posts")
+    @db.execute("ALTER TABLE posts_backup RENAME TO posts")
+    puts "Removed 'published' and 'published_at' columns from posts"
+  end
+end
+
+# You can also add a reusable helper to your Migrator:
+# framework/lib/tracks/migrator.rb — add helper methods
+
+module Tracks
+  class Migrator
+    def add_column(table, column, type, default: nil, null: true)
+      sql = "ALTER TABLE #{table} ADD COLUMN #{column} #{type}"
+      sql += " DEFAULT #{default}" unless default.nil?
+      sql += " NOT NULL" unless null
+      @db.execute(sql)
+    end
+
+    def remove_column(table, column)
+      # SQLite workaround: copy table without the column
+      columns = @db.execute("PRAGMA table_info(#{table})")
+        .map { |c| c["name"] }
+        .reject { |c| c == column.to_s }
+
+      col_list = columns.join(", ")
+      @db.execute("CREATE TABLE #{table}_new AS SELECT #{col_list} FROM #{table}")
+      @db.execute("DROP TABLE #{table}")
+      @db.execute("ALTER TABLE #{table}_new RENAME TO #{table}")
+    end
+  end
+end
+```
+
+### Exercise 2 — `seeds.rb` and `rake db:seed`
+
+```ruby
+# db/seeds.rb — sample data for development
+
+require_relative "../framework/lib/tracks"
+require_relative "../app/models/user"
+require_relative "../app/models/post"
+
+puts "Seeding database..."
+
+# Clear existing data
+Tracks::Model.db.execute("DELETE FROM posts")
+Tracks::Model.db.execute("DELETE FROM users")
+
+# Create users
+yosia = User.new(
+  name:            "Yosia",
+  email:           "yosia@example.com",
+  password_digest: "password"
+)
+yosia.save
+puts "Created user: #{yosia.name} (##{yosia.id})"
+
+alice = User.new(
+  name:            "Alice",
+  email:           "alice@example.com",
+  password_digest: "password"
+)
+alice.save
+puts "Created user: #{alice.name} (##{alice.id})"
+
+# Create posts
+[
+  { title: "Getting Started with Ruby",      body: "Ruby is a dynamic language..." },
+  { title: "Building Web Apps from Scratch", body: "Today we'll build a framework..." },
+  { title: "Understanding Rack",             body: "Rack is the foundation of..." }
+].each do |attrs|
+  post = Post.new(attrs.merge(user_id: yosia.id))
+  post.save
+  puts "Created post: #{post.title} (##{post.id})"
+end
+
+puts "Seeding complete! #{User.count} users, #{Post.count} posts."
+```
+
+```ruby
+# Rakefile — rake tasks for database management
+
+require_relative "framework/lib/tracks"
+
+namespace :db do
+  desc "Run pending migrations"
+  task :migrate do
+    db = Tracks::Model.db
+    migrator = Tracks::Migrator.new(db)
+    migrator.migrate
+  end
+
+  desc "Rollback the last migration"
+  task :rollback do
+    db = Tracks::Model.db
+    migrator = Tracks::Migrator.new(db)
+    migrator.rollback
+  end
+
+  desc "Seed the database with sample data"
+  task :seed do
+    load "db/seeds.rb"
+  end
+
+  desc "Drop, recreate, migrate, and seed"
+  task :reset => [:drop, :migrate, :seed]
+
+  task :drop do
+    db_path = ENV["DATABASE_PATH"] || "db/development.sqlite3"
+    File.delete(db_path) if File.exist?(db_path)
+    puts "Database dropped."
+  end
+end
+
+# Run with: rake db:migrate
+#            rake db:seed
+#            rake db:reset
+```
+
+### Exercise 3 — SQL injection protection
+
+```ruby
+# Demonstration of why parameterized queries are safe
+# Run this standalone to see the difference:
+
+require 'sqlite3'
+
+db = SQLite3::Database.new(":memory:")
+db.results_as_hash = true
+db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)")
+db.execute("INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.com')")
+db.execute("INSERT INTO users (name, email) VALUES ('Bob', 'bob@example.com')")
+
+# DANGEROUS — string interpolation allows SQL injection:
+def unsafe_find(db, email)
+  # An attacker can pass: "' OR '1'='1" to return ALL rows
+  # Or: "'; DROP TABLE users; --" to destroy data
+  db.execute("SELECT * FROM users WHERE email = '#{email}'")
+end
+
+# SAFE — parameterized query:
+def safe_find(db, email)
+  # The ? is replaced safely; special chars are escaped automatically
+  db.execute("SELECT * FROM users WHERE email = ?", [email])
+end
+
+# Attack attempt:
+attack = "' OR '1'='1"
+puts "UNSAFE with attack input:"
+puts unsafe_find(db, attack).inspect
+# => Returns ALL rows! Attacker bypassed the WHERE clause.
+
+puts "\nSAFE with attack input:"
+puts safe_find(db, attack).inspect
+# => [] — no results. The literal string is treated as data, not SQL.
+
+# Tracks always uses ? placeholders — this is already safe by design:
+# Model.find(id)             → "SELECT ... WHERE id = ?" [id]
+# Model.where(email: value)  → "SELECT ... WHERE email = ?" [value]
+# model.save                 → "INSERT ... VALUES (?, ...)" [vals]
+```
+
+### Exercise 4 — `find_or_create_by`
+
+```ruby
+# framework/lib/tracks/model.rb — add find_or_create_by class method
+
+module Tracks
+  class Model
+    # Find a record matching conditions, or create it if not found.
+    # Returns the existing or newly created record.
+    # Returns [record, created?] when called with block variant.
+    #
+    # User.find_or_create_by(email: "test@example.com")
+    # User.find_or_create_by(email: "test@example.com") { |u| u.name = "Test" }
+    def self.find_or_create_by(conditions)
+      existing = find_by(conditions)
+      return existing if existing
+
+      record = new(conditions)
+      yield record if block_given?
+      record.save
+      record
+    end
+
+    # Raise if creation fails validation:
+    def self.find_or_create_by!(conditions)
+      existing = find_by(conditions)
+      return existing if existing
+
+      record = new(conditions)
+      yield record if block_given?
+      record.save!
+      record
+    end
+  end
+end
+
+# Usage:
+# File: app/controllers/sessions_controller.rb
+class SessionsController < Tracks::BaseController
+  def create
+    # Find existing user or create one (OAuth-style flow)
+    user = User.find_or_create_by(email: params["email"]) do |u|
+      u.name            = params["name"] || "New User"
+      u.password_digest = params["password"]
+    end
+
+    if user.persisted?
+      session[:user_id] = user.id
+      redirect_to "/posts"
+    else
+      @error = "Could not sign in: #{user.errors.inspect}"
+      render :new
+    end
+  end
+end
+
+# More examples:
+tag = Tag.find_or_create_by(name: "ruby")
+puts tag.id   # existing id or newly assigned id
+
+category = Category.find_or_create_by(slug: "tech") do |c|
+  c.name = "Technology"
+end
+```
+
+### Exercise 5 — `has_many through:` (join table)
+
+```ruby
+# framework/lib/tracks/associations.rb — extend has_many with through: support
+
+module Tracks
+  module Associations
+    module ClassMethods
+      def has_many(name, class_name: nil, foreign_key: nil, through: nil, source: nil)
+        if through
+          # has_many :tags, through: :post_tags
+          # Joins via the intermediate table
+          join_association  = through.to_s          # "post_tags"
+          target_class_name = class_name || name.to_s.chomp("s").capitalize  # "Tag"
+          source_name       = source || name.to_s.chomp("s")  # "tag"
+
+          define_method(name) do
+            # Get all join records (e.g. post.post_tags)
+            join_records = send(join_association)
+            # Extract the related records (e.g. tag)
+            join_records.map { |jr| jr.send(source_name) }
+          end
+        else
+          # Standard has_many (existing behaviour)
+          klass = class_name  || name.to_s.chomp("s").capitalize
+          fk    = foreign_key || "#{self.name.downcase}_id"
+
+          define_method(name) do
+            Object.const_get(klass).where(fk => @attributes["id"])
+          end
+        end
+      end
+    end
+  end
+end
+
+# Usage — a Post can have many Tags through PostTag join model:
+#
+# Database schema:
+#   posts:      id, title, body
+#   tags:       id, name
+#   post_tags:  id, post_id, tag_id
+
+# File: app/models/post_tag.rb
+class PostTag < Tracks::Model
+  belongs_to :post
+  belongs_to :tag
+end
+
+# File: app/models/post.rb
+class Post < Tracks::Model
+  has_many :post_tags
+  has_many :tags, through: :post_tags   # post.tags → all Tag objects
+
+  belongs_to :user
+end
+
+# File: app/models/tag.rb
+class Tag < Tracks::Model
+  has_many :post_tags
+  has_many :posts, through: :post_tags  # tag.posts → all Post objects
+end
+
+# In use:
+post = Post.find(1)
+puts post.tags.map(&:name).inspect  # => ["ruby", "rails", "web"]
+
+tag = Tag.find_by(name: "ruby")
+puts tag.posts.map(&:title).inspect # => ["Getting Started with Ruby", ...]
+```
+
+---
+
 ## What You Learned
 
 | Concept | Key point |

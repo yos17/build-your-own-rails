@@ -435,6 +435,156 @@ This is almost exactly how Rails `validates` works. It's just a class method tha
 
 ---
 
+## Solutions
+
+### Exercise 1 — `Integer#factorial`
+
+```ruby
+class Integer
+  def factorial
+    return 1 if self <= 1
+    self * (self - 1).factorial
+  end
+end
+
+puts 5.factorial   # => 120
+puts 0.factorial   # => 1
+puts 1.factorial   # => 1
+puts 10.factorial  # => 3628800
+```
+
+### Exercise 2 — `FlexibleHash` with `method_missing`
+
+```ruby
+class FlexibleHash
+  def initialize(hash = {})
+    @data = hash.transform_keys(&:to_s)
+  end
+
+  def []=(key, value)
+    @data[key.to_s] = value
+  end
+
+  def [](key)
+    @data[key.to_s]
+  end
+
+  def method_missing(name, *args)
+    key = name.to_s
+    if key.end_with?("=")
+      @data[key.chomp("=")] = args.first
+    elsif @data.key?(key)
+      @data[key]
+    else
+      super
+    end
+  end
+
+  def respond_to_missing?(name, include_private = false)
+    key = name.to_s.chomp("=")
+    @data.key?(key) || super
+  end
+end
+
+h = FlexibleHash.new(name: "Yosia", age: 30)
+puts h.name    # => "Yosia"
+puts h.age     # => 30
+h.email = "yosia@example.com"
+puts h.email   # => "yosia@example.com"
+puts h.respond_to?(:name)  # => true
+```
+
+### Exercise 3 — Dynamic role predicates with `define_method`
+
+```ruby
+class User
+  ROLES = ["admin", "user", "guest"].freeze
+
+  def initialize(role)
+    @role = role
+  end
+
+  ROLES.each do |role|
+    define_method("is_#{role}?") do
+      @role == role
+    end
+  end
+end
+
+u = User.new("admin")
+puts u.is_admin?   # => true
+puts u.is_user?    # => false
+puts u.is_guest?   # => false
+
+u2 = User.new("guest")
+puts u2.is_guest?  # => true
+puts u2.is_admin?  # => false
+```
+
+### Exercise 4 — HTML tag DSL
+
+```ruby
+class HTML
+  def self.tag(*tag_names)
+    tag_names.each do |tag|
+      define_method(tag) do |content = ""|
+        "<#{tag}>#{content}</#{tag}>"
+      end
+    end
+  end
+
+  tag :div, :p, :span, :h1, :h2, :ul, :li
+end
+
+html = HTML.new
+puts html.div("hello")          # => "<div>hello</div>"
+puts html.h1("Welcome")         # => "<h1>Welcome</h1>"
+puts html.p("A paragraph")      # => "<p>A paragraph</p>"
+puts html.span("highlighted")   # => "<span>highlighted</span>"
+
+# Nested tags:
+puts html.div(html.p("inside"))  # => "<div><p>inside</p></div>"
+```
+
+### Exercise 5 — `my_attr_accessor`
+
+```ruby
+class Object
+  def self.my_attr_accessor(*names)
+    names.each do |name|
+      # Getter
+      define_method(name) do
+        instance_variable_get("@#{name}")
+      end
+
+      # Setter
+      define_method("#{name}=") do |value|
+        instance_variable_set("@#{name}", value)
+      end
+    end
+  end
+end
+
+class Person
+  my_attr_accessor :name, :age, :email
+
+  def initialize(name, age)
+    @name = name
+    @age  = age
+  end
+end
+
+p = Person.new("Yosia", 30)
+puts p.name      # => "Yosia"
+puts p.age       # => 30
+p.email = "yosia@example.com"
+puts p.email     # => "yosia@example.com"
+p.name = "Updated"
+puts p.name      # => "Updated"
+```
+
+---
+
 ## What You Learned
 
 | Technique | Used in Rails for |

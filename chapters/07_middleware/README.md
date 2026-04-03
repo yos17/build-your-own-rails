@@ -349,6 +349,347 @@ Then include the token in every form:
 
 ---
 
+## Solutions
+
+### Exercise 1 — Rate limiter middleware
+
+```ruby
+# framework/lib/tracks/middleware/rate_limiter.rb
+
+module Tracks
+  module Middleware
+    class RateLimiter
+      # Block IPs that make more than `max_requests` requests per `window` seconds.
+      def initialize(app, max_requests: 100, window: 60)
+        @app          = app
+        @max_requests = max_requests
+        @window       = window
+        @requests     = {}   # { ip => [timestamp, timestamp, ...] }
+        @mutex        = Mutex.new
+      end
+
+      def call(env)
+        ip = env["REMOTE_ADDR"] || "unknown"
+
+        if rate_limited?(ip)
+          return [
+            429,
+            { "Content-Type" => "text/plain", "Retry-After" => @window.to_s },
+            ["Too Many Requests — slow down!"]
+          ]
+        end
+
+        @app.call(env)
+      end
+
+      private
+
+      def rate_limited?(ip)
+        now = Time.now.to_f
+
+        @mutex.synchronize do
+          # Remove timestamps outside the current window
+          @requests[ip] ||= []
+          @requests[ip].reject! { |t| t < now - @window }
+
+          if @requests[ip].size >= @max_requests
+            true   # rate limited
+          else
+            @requests[ip] << now
+            false
+          end
+        end
+      end
+    end
+  end
+end
+
+# Register in your Tracks::Application (framework/lib/tracks/application.rb):
+#
+#   @middleware.use(Middleware::RateLimiter, max_requests: 100, window: 60)
+#
+# Or in config.ru:
+#
+#   class App < Tracks::Application
+#     use Tracks::Middleware::RateLimiter, max_requests: 50, window: 60
+#   end
+```
+
+### Exercise 2 — Compression middleware (gzip)
+
+```ruby
+# framework/lib/tracks/middleware/compressor.rb
+
+require 'zlib'
+require 'stringio'
+
+module Tracks
+  module Middleware
+    class Compressor
+      MIN_SIZE = 1024   # Only compress responses larger than 1KB
+
+      def initialize(app)
+        @app = app
+      end
+
+      def call(env)
+        status, headers, body = @app.call(env)
+
+        # Only compress if client accepts gzip
+        accept_encoding = env["HTTP_ACCEPT_ENCODING"] || ""
+        return [status, headers, body] unless accept_encoding.include?("gzip")
+
+        # Collect body content
+        content = body.reduce("") { |s, chunk| s + chunk }
+        return [status, headers, [content]] if content.bytesize < MIN_SIZE
+
+        # Compress the content
+        compressed = gzip(content)
+
+        headers["Content-Encoding"] = "gzip"
+        headers["Content-Length"]   = compressed.bytesize.to_s
+        headers.delete("Content-Length") if headers["Transfer-Encoding"] == "chunked"
+
+        [status, headers, [compressed]]
+      end
+
+      private
+
+      def gzip(content)
+        output = StringIO.new
+        gz = Zlib::GzipWriter.new(output)
+        gz.write(content)
+        gz.close
+        output.string
+      end
+    end
+  end
+end
+
+# Register in your app:
+#   use Tracks::Middleware::Compressor
+#
+# The middleware checks the Accept-Encoding header — curl example:
+#   curl -H "Accept-Encoding: gzip" http://localhost:3000/posts
+```
+
+### Exercise 3 — Request ID middleware
+
+```ruby
+# framework/lib/tracks/middleware/request_id.rb
+
+require 'securerandom'
+
+module Tracks
+  module Middleware
+    class RequestId
+      HEADER = "X-Request-ID"
+
+      def initialize(app)
+        @app = app
+      end
+
+      def call(env)
+        # Use incoming request ID (from load balancer/proxy) or generate a new one
+        request_id = env["HTTP_X_REQUEST_ID"]
+        request_id = nil if request_id&.empty?
+        request_id ||= SecureRandom.uuid
+
+        # Sanitize — only allow safe characters
+        request_id = request_id.gsub(/[^\w\-]/, "")[0, 255]
+
+        # Make available to the app (e.g., for logging)
+        env["tracks.request_id"] = request_id
+
+        status, headers, body = @app.call(env)
+
+        # Echo it back in the response
+        headers[HEADER] = request_id
+
+        [status, headers, body]
+      end
+    end
+  end
+end
+
+# Register in your app:
+#   use Tracks::Middleware::RequestId
+#
+# In your Logger middleware, include the request ID in log output:
+#   request_id = env["tracks.request_id"] || "-"
+#   puts "[#{request_id}] GET /posts → 200 (12ms)"
+#
+# This makes it easy to grep all log lines for a single request.
+```
+
+### Exercise 4 — Flash messages in session middleware
+
+```ruby
+# framework/lib/tracks/middleware/session.rb — add flash sweep to Session middleware
+
+module Tracks
+  module Middleware
+    class Session
+      KEY     = "_tracks_session"
+      @@store = {}
+
+      def initialize(app)
+        @app = app
+      end
+
+      def call(env)
+        sid = parse_cookie(env, KEY) || SecureRandom.hex(32)
+        @@store[sid] ||= {}
+        session = @@store[sid]
+
+        # Sweep flash: remove entries that were already shown last request
+        if session[:_flash_sweep]
+          session[:_flash_sweep].each { |k| (session[:flash] ||= {}).delete(k) }
+        end
+        session[:_flash_sweep] = (session[:flash] || {}).keys
+
+        env["tracks.session"]    = session
+        env["tracks.session_id"] = sid
+
+        status, headers, body = @app.call(env)
+        headers["Set-Cookie"] = "#{KEY}=#{sid}; HttpOnly; Path=/"
+        [status, headers, body]
+      end
+
+      private
+
+      def parse_cookie(env, key)
+        (env["HTTP_COOKIE"] || "").split("; ").each_with_object({}) do |pair, h|
+          k, v = pair.split("=", 2); h[k] = v
+        end[key]
+      end
+    end
+  end
+end
+
+# framework/lib/tracks/base_controller.rb — add flash helper
+
+module Tracks
+  class BaseController
+    # Access flash messages (hash stored in session[:flash])
+    def flash
+      session[:flash] ||= {}
+    end
+  end
+end
+
+# Usage in controllers:
+# File: app/controllers/posts_controller.rb
+class PostsController < Tracks::BaseController
+  def create
+    @post = Post.new(title: params["post[title]"], body: params["post[body]"])
+    if @post.save
+      flash[:notice] = "Post was successfully created."
+      redirect_to "/posts/#{@post.id}"
+    else
+      flash[:error] = "Failed to create post."
+      render :new
+    end
+  end
+
+  def destroy
+    Post.find(params["id"]).destroy
+    flash[:notice] = "Post deleted."
+    redirect_to "/posts"
+  end
+end
+
+# In app/views/layouts/application.html.erb:
+#
+# <% if flash[:notice] %>
+#   <div class="flash flash-notice"><%= h(flash[:notice]) %></div>
+# <% end %>
+# <% if flash[:error] %>
+#   <div class="flash flash-error"><%= h(flash[:error]) %></div>
+# <% end %>
+```
+
+### Exercise 5 — BasicAuth middleware
+
+```ruby
+# framework/lib/tracks/middleware/basic_auth.rb
+
+require 'base64'
+
+module Tracks
+  module Middleware
+    class BasicAuth
+      def initialize(app, username:, password:)
+        @app      = app
+        @username = username
+        @password = password
+      end
+
+      def call(env)
+        unless authorized?(env)
+          return [
+            401,
+            {
+              "Content-Type"     => "text/plain",
+              "WWW-Authenticate" => 'Basic realm="Restricted Area"'
+            },
+            ["HTTP Basic: Access denied."]
+          ]
+        end
+
+        @app.call(env)
+      end
+
+      private
+
+      def authorized?(env)
+        auth_header = env["HTTP_AUTHORIZATION"] || ""
+        return false unless auth_header.start_with?("Basic ")
+
+        encoded    = auth_header.sub("Basic ", "")
+        decoded    = Base64.decode64(encoded)
+        user, pass = decoded.split(":", 2)
+
+        # Use a constant-time comparison to avoid timing attacks
+        secure_compare(user.to_s, @username) &&
+          secure_compare(pass.to_s, @password)
+      end
+
+      def secure_compare(a, b)
+        return false if a.length != b.length
+        # XOR each byte — result is 0 only if all bytes match
+        result = 0
+        a.bytes.zip(b.bytes).each { |x, y| result |= x ^ y }
+        result == 0
+      end
+    end
+  end
+end
+
+# Register in your app (config.ru or application.rb):
+#
+#   use Tracks::Middleware::BasicAuth, username: "admin", password: "secret"
+#
+# Protects ALL routes. For partial protection, check the path:
+#
+# class App < Tracks::Application
+#   routes do
+#     get "/admin",        to: "admin#index"
+#     get "/admin/stats",  to: "admin#stats"
+#     resources :posts
+#   end
+# end
+#
+# config.ru:
+#   admin_app = Rack::Builder.new do
+#     use Tracks::Middleware::BasicAuth, username: "admin", password: "secret"
+#     run App.new
+#   end
+#   run admin_app
+```
+
+---
+
 ## What You Learned
 
 | Concept | Key point |

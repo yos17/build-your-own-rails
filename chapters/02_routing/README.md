@@ -267,6 +267,244 @@ This is what Rails does — `resources` is just a method that calls `get`, `post
 
 ---
 
+## Solutions
+
+### Exercise 1 — Add `put` method to the router
+
+The router already has a `put` method in the framework. Here's how it's implemented and used:
+
+```ruby
+# framework/lib/tracks/router.rb  (already present — shown for reference)
+module Tracks
+  class Router
+    def put(path, to:)
+      add_route("PUT", path, to)
+    end
+  end
+end
+
+# Usage in your app's routes:
+router = Tracks::Router.new
+router.draw do
+  put "/posts/:id", to: "posts#update"
+end
+
+route, params = router.route_for("PUT", "/posts/7")
+puts route.controller  # => "posts"
+puts route.action      # => "update"
+puts params            # => {"id" => "7"}
+```
+
+### Exercise 2 — Route constraints (only match digits for `:id`)
+
+```ruby
+# framework/lib/tracks/router.rb — extend with constraints support
+
+module Tracks
+  class Router
+    # Override Route struct to include constraints
+    Route = Struct.new(:method, :pattern, :controller, :action, :constraints)
+
+    def get(path, to:, constraints: {})
+      add_route("GET", path, to, constraints)
+    end
+
+    def post(path, to:, constraints: {})
+      add_route("POST", path, to, constraints)
+    end
+
+    def patch(path, to:, constraints: {})
+      add_route("PATCH", path, to, constraints)
+    end
+
+    def put(path, to:, constraints: {})
+      add_route("PUT", path, to, constraints)
+    end
+
+    def delete(path, to:, constraints: {})
+      add_route("DELETE", path, to, constraints)
+    end
+
+    def route_for(method, path)
+      @routes.each do |route|
+        next unless route.method == method
+        params = match(route.pattern, path)
+        next unless params
+        # Check constraints
+        next unless constraints_match?(route.constraints || {}, params)
+        return [route, params]
+      end
+      nil
+    end
+
+    private
+
+    def add_route(method, path, to, constraints = {})
+      controller, action = to.split("#")
+      @routes << Route.new(method, path, controller, action, constraints)
+    end
+
+    def constraints_match?(constraints, params)
+      constraints.all? do |key, pattern|
+        params[key.to_s]&.match?(pattern)
+      end
+    end
+  end
+end
+
+# Usage:
+router = Tracks::Router.new
+router.draw do
+  get "/posts/:id",       to: "posts#show",   constraints: { id: /\d+/ }
+  get "/posts/:slug",     to: "posts#by_slug"   # fallback for non-numeric
+end
+
+# /posts/42   → posts#show (matches \d+)
+# /posts/hello → posts#by_slug (42 fails the digit constraint on first route)
+route, params = router.route_for("GET", "/posts/42")
+puts route.action   # => "show"
+
+route, params = router.route_for("GET", "/posts/my-slug")
+puts route.action   # => "by_slug"
+```
+
+### Exercise 3 — Nested resources
+
+```ruby
+# framework/lib/tracks/router.rb — add nested resources support
+
+module Tracks
+  class Router
+    def resources(name, &block)
+      n = name.to_s
+      get    "/#{n}",          to: "#{n}#index"
+      get    "/#{n}/new",      to: "#{n}#new"
+      post   "/#{n}",          to: "#{n}#create"
+      get    "/#{n}/:id",      to: "#{n}#show"
+      get    "/#{n}/:id/edit", to: "#{n}#edit"
+      patch  "/#{n}/:id",      to: "#{n}#update"
+      delete "/#{n}/:id",      to: "#{n}#destroy"
+
+      if block_given?
+        # Nested resources: save parent name, eval block, restore
+        @parent_resource = { name: n, param: "#{n.chomp('s')}_id" }
+        instance_eval(&block)
+        @parent_resource = nil
+      end
+    end
+
+    def nested_resources(name)
+      parent = @parent_resource
+      return resources(name) unless parent
+
+      pn = parent[:name]      # e.g. "posts"
+      pp = parent[:param]     # e.g. "post_id"
+      n  = name.to_s          # e.g. "comments"
+
+      get    "/#{pn}/:#{pp}/#{n}",          to: "#{n}#index"
+      get    "/#{pn}/:#{pp}/#{n}/new",      to: "#{n}#new"
+      post   "/#{pn}/:#{pp}/#{n}",          to: "#{n}#create"
+      get    "/#{pn}/:#{pp}/#{n}/:id",      to: "#{n}#show"
+      get    "/#{pn}/:#{pp}/#{n}/:id/edit", to: "#{n}#edit"
+      patch  "/#{pn}/:#{pp}/#{n}/:id",      to: "#{n}#update"
+      delete "/#{pn}/:#{pp}/#{n}/:id",      to: "#{n}#destroy"
+    end
+  end
+end
+
+# Usage — wire up in config.ru or application.rb:
+router = Tracks::Router.new
+router.draw do
+  resources :posts do
+    nested_resources :comments
+  end
+end
+
+# Generated routes include:
+# GET  /posts/:post_id/comments         → comments#index
+# POST /posts/:post_id/comments         → comments#create
+# GET  /posts/:post_id/comments/:id     → comments#show
+# etc.
+
+route, params = router.route_for("GET", "/posts/5/comments/3")
+puts route.controller   # => "comments"
+puts route.action       # => "show"
+puts params             # => {"post_id" => "5", "id" => "3"}
+```
+
+### Exercise 4 — `root` helper
+
+The framework already includes `root`. Here's the implementation and usage:
+
+```ruby
+# framework/lib/tracks/router.rb  (already present — shown for reference)
+module Tracks
+  class Router
+    def root(to:)
+      get "/", to: to
+    end
+  end
+end
+
+# Usage in your app:
+# File: config.ru  (or inside Tracks::Application#routes)
+router = Tracks::Router.new
+router.draw do
+  root to: "home#index"
+  resources :posts
+end
+
+route, params = router.route_for("GET", "/")
+puts route.controller   # => "home"
+puts route.action       # => "index"
+```
+
+### Exercise 5 — Print all routes (like `rails routes`)
+
+```ruby
+# Add to framework/lib/tracks/router.rb
+
+module Tracks
+  class Router
+    def print_routes
+      # Header
+      puts "\n%-10s %-35s %-25s" % ["Method", "Path", "Controller#Action"]
+      puts "-" * 72
+
+      @routes.each do |route|
+        puts "%-10s %-35s %-25s" % [
+          route.method,
+          route.pattern,
+          "#{route.controller}##{route.action}"
+        ]
+      end
+      puts
+    end
+  end
+end
+
+# Usage — run in a rake task or console:
+# File: bin/routes (executable script)
+require_relative "../framework/lib/tracks"
+require_relative "../config/routes"   # loads your draw block
+
+Tracks::Application.router.print_routes
+
+# Example output:
+# Method     Path                                Controller#Action
+# ------------------------------------------------------------------------
+# GET        /                                   home#index
+# GET        /posts                              posts#index
+# GET        /posts/new                          posts#new
+# POST       /posts                              posts#create
+# GET        /posts/:id                          posts#show
+# GET        /posts/:id/edit                     posts#edit
+# PATCH      /posts/:id                          posts#update
+# DELETE     /posts/:id                          posts#destroy
+```
+
+---
+
 ## What You Learned
 
 | Concept | What it does |
